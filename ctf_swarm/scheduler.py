@@ -86,16 +86,24 @@ class Scheduler:
                 evidence=tuple(state.evidence),
             )
         )
-        if isinstance(result, Candidate) and await self.verifier.verify(result):
-            state.solved_value = result.value
-            state.solved_by = result.agent_id
-            state.cancelled = True
-            self.events.append(Event(EventType.VERIFIED, challenge.id, result.agent_id, result))
-            self.events.append(Event(EventType.GLOBAL_CANCEL, challenge.id, result.agent_id))
-            return result.value
-        if isinstance(result, Evidence):
+
+        # A critic's output is always recorded as a critique before we decide
+        # whether it constitutes a verified candidate. This keeps the event
+        # stream auditable and guarantees the critic's shared-context work is
+        # visible even when it immediately finds the solution.
+        self.events.append(Event(EventType.CRITIQUE, challenge.id, critic.id, result))
+
+        if isinstance(result, Candidate):
+            state.candidates.append(result)
+            if await self.verifier.verify(result):
+                state.solved_value = result.value
+                state.solved_by = result.agent_id
+                state.cancelled = True
+                self.events.append(Event(EventType.VERIFIED, challenge.id, result.agent_id, result))
+                self.events.append(Event(EventType.GLOBAL_CANCEL, challenge.id, result.agent_id))
+                return result.value
+        elif isinstance(result, Evidence):
             board.add_evidence(result)
-            self.events.append(Event(EventType.CRITIQUE, challenge.id, result.agent_id, result))
         return None
 
     async def solve(
