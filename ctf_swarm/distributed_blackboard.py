@@ -20,6 +20,7 @@ class DistributedBlackboard:
         self.evidence_key = f"{self.prefix}:evidence"
         self.task_dead_key = f"ctf:bb:{task_id}:dead"
         self.task_open_key = f"ctf:bb:{task_id}:open"
+        self.task_explored_key = f"ctf:bb:{task_id}:explored"
         self.history_key = f"ctf:bb:{task_id}:history"
 
     async def register_workers(self, worker_ids: list[str]) -> None:
@@ -34,6 +35,8 @@ class DistributedBlackboard:
         await self.redis.rpush(self.history_key, encoded)
         if evidence.failed_paths:
             await self.redis.sadd(self.task_dead_key, *evidence.failed_paths)
+        if evidence.tested_paths:
+            await self.redis.sadd(self.task_explored_key, *evidence.tested_paths)
         if evidence.next_hypotheses:
             await self.redis.sadd(self.task_open_key, *evidence.next_hypotheses)
         await self.redis.srem(self.pending_key, evidence.agent_id)
@@ -50,16 +53,21 @@ class DistributedBlackboard:
             "evidence": current_round_evidence,
             "history": history,
             "dead_ends": sorted(await self.redis.smembers(self.task_dead_key)),
+            "explored_paths": sorted(await self.redis.smembers(self.task_explored_key)),
             "open_hypotheses": sorted(await self.redis.smembers(self.task_open_key)),
             "pending_workers": sorted(await self.redis.smembers(self.pending_key)),
         }
 
     async def clear(self) -> None:
-        # Only round-local barrier/evidence state is removed. Search memory is task-wide.
         await self.redis.delete(self.pending_key, self.evidence_key)
 
 
-ROUND_SEQUENCE = [Round.INDEPENDENT, Round.COLLABORATIVE, Round.DIVERGENT]
+ROUND_SEQUENCE = [
+    Round.INDEPENDENT,
+    Round.COLLABORATIVE,
+    Round.DIVERGENT,
+    Round.ADVERSARIAL,
+]
 
 
 def next_round(round_name: str) -> str | None:
