@@ -11,7 +11,13 @@ class AgentContext:
     challenge: Challenge
     round: Round
     dead_ends: frozenset[str]
+    explored_paths: frozenset[str]
+    open_hypotheses: frozenset[str]
     evidence: tuple[Evidence, ...]
+
+    def must_diverge_from(self) -> frozenset[str]:
+        """Paths an agent must avoid during divergent/adversarial rounds."""
+        return self.dead_ends | self.explored_paths
 
 
 class Agent(Protocol):
