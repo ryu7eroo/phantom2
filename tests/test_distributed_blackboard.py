@@ -59,7 +59,8 @@ class FakeRedis:
 def test_next_round_sequence():
     assert next_round(Round.INDEPENDENT.value) == Round.COLLABORATIVE.value
     assert next_round(Round.COLLABORATIVE.value) == Round.DIVERGENT.value
-    assert next_round(Round.DIVERGENT.value) is None
+    assert next_round(Round.DIVERGENT.value) == Round.ADVERSARIAL.value
+    assert next_round(Round.ADVERSARIAL.value) is None
 
 
 def test_blackboard_opens_next_round_only_after_all_workers_report():
