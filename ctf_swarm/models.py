@@ -22,6 +22,8 @@ class EventType(Enum):
     REJECTED = "rejected"
     ROUND_ADVANCED = "round_advanced"
     GLOBAL_CANCEL = "global_cancel"
+    EVIDENCE_MERGED = "evidence_merged"
+    CRITIQUE = "critique"
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,9 @@ class Evidence:
     challenge_id: str
     claim: str
     evidence: tuple[str, ...] = ()
+    tested_paths: tuple[str, ...] = ()
     failed_paths: tuple[str, ...] = ()
+    next_hypotheses: tuple[str, ...] = ()
     confidence: float = 0.0
     round: Round = Round.INDEPENDENT
 
@@ -61,7 +65,10 @@ class TaskState:
     evidence: list[Evidence] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     dead_ends: set[str] = field(default_factory=set)
+    explored_paths: set[str] = field(default_factory=set)
+    open_hypotheses: set[str] = field(default_factory=set)
     solved_value: str | None = None
+    solved_by: str | None = None
     cancelled: bool = False
 
     def is_solved(self) -> bool:
