@@ -6,6 +6,7 @@ import os
 from redis.asyncio import Redis
 
 from .dispatcher import Dispatcher
+from .persistence import init_database
 
 
 async def main() -> None:
@@ -14,6 +15,7 @@ async def main() -> None:
         "DATABASE_URL",
         "postgresql://ctf:ctfdev@localhost:5432/ctf_swarm",
     )
+    await init_database(database_url)
     redis = Redis.from_url(redis_url, decode_responses=True)
     dispatcher = Dispatcher(redis, database_url)
     try:
