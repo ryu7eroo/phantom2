@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from uuid import UUID
 
+import psycopg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
@@ -21,6 +23,16 @@ class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     category: str = Field(min_length=1, max_length=50)
     points: int = Field(default=0, ge=0)
+
+
+class WorkerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    model: str = Field(min_length=1, max_length=200)
+    capabilities: dict[str, object] = Field(default_factory=dict)
+
+
+class WorkerHeartbeat(BaseModel):
+    status: str = Field(default="ready", min_length=1, max_length=50)
 
 
 @asynccontextmanager
@@ -45,9 +57,6 @@ async def health() -> dict[str, object]:
     finally:
         await redis.aclose()
 
-    import asyncio
-    import psycopg
-
     def ping_db() -> bool:
         try:
             with psycopg.connect(DATABASE_URL) as conn:
@@ -58,7 +67,6 @@ async def health() -> dict[str, object]:
             return False
 
     database_ok = await asyncio.to_thread(ping_db)
-
     healthy = redis_ok and database_ok
     return {
         "status": "ok" if healthy else "degraded",
@@ -88,3 +96,36 @@ async def get_task_endpoint(task_id: UUID) -> dict[str, object]:
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+@app.post("/workers/register", status_code=201)
+async def register_worker_endpoint(payload: WorkerCreate) -> dict[str, object]:
+    from .persistence import register_worker
+
+    redis = Redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        return await register_worker(
+            DATABASE_URL,
+            redis,
+            payload.name,
+            payload.model,
+            payload.capabilities,
+        )
+    finally:
+        await redis.aclose()
+
+
+@app.post("/workers/{worker_id}/heartbeat")
+async def heartbeat_endpoint(worker_id: str, payload: WorkerHeartbeat) -> dict[str, object]:
+    from .persistence import heartbeat_worker
+
+    if not await heartbeat_worker(DATABASE_URL, worker_id, payload.status):
+        raise HTTPException(status_code=404, detail="worker not found")
+    return {"ok": True, "worker_id": worker_id, "status": payload.status}
+
+
+@app.get("/workers")
+async def list_workers_endpoint() -> list[dict[str, object]]:
+    from .persistence import list_workers
+
+    return await list_workers(DATABASE_URL)
