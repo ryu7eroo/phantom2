@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+import asyncio
+import json
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -21,15 +23,34 @@ CREATE TABLE IF NOT EXISTS tasks (
 )
 """
 
+CREATE_WORKERS_SQL = """
+CREATE TABLE IF NOT EXISTS workers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'ready',
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+
+def _serialize_row(row: tuple[Any, ...], columns: list[str]) -> dict[str, Any]:
+    result = dict(zip(columns, row))
+    for key, value in list(result.items()):
+        if hasattr(value, "isoformat"):
+            result[key] = value.isoformat()
+    return result
+
 
 async def init_database(database_url: str) -> None:
     def create() -> None:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(CREATE_TASKS_SQL)
+                cur.execute(CREATE_WORKERS_SQL)
             conn.commit()
-
-    import asyncio
 
     await asyncio.to_thread(create)
 
@@ -58,17 +79,12 @@ async def create_task(
                 row = cur.fetchone()
             conn.commit()
         assert row is not None
-        columns = [
-            "id", "title", "category", "points", "status", "round",
-            "created_at", "updated_at",
-        ]
-        result = dict(zip(columns, row))
+        result = _serialize_row(
+            row,
+            ["id", "title", "category", "points", "status", "round", "created_at", "updated_at"],
+        )
         result["id"] = str(result["id"])
-        result["created_at"] = result["created_at"].isoformat()
-        result["updated_at"] = result["updated_at"].isoformat()
         return result
-
-    import asyncio
 
     result = await asyncio.to_thread(insert)
     await redis.xadd(
@@ -101,16 +117,99 @@ async def get_task(database_url: str, task_id: UUID) -> dict[str, Any] | None:
                 row = cur.fetchone()
         if row is None:
             return None
-        columns = [
-            "id", "title", "category", "points", "status", "round",
-            "created_at", "updated_at",
-        ]
-        result = dict(zip(columns, row))
+        result = _serialize_row(
+            row,
+            ["id", "title", "category", "points", "status", "round", "created_at", "updated_at"],
+        )
         result["id"] = str(result["id"])
-        result["created_at"] = result["created_at"].isoformat()
-        result["updated_at"] = result["updated_at"].isoformat()
         return result
 
-    import asyncio
+    return await asyncio.to_thread(fetch)
+
+
+async def register_worker(
+    database_url: str,
+    redis: Redis,
+    name: str,
+    model: str,
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    worker_id = str(uuid4())
+
+    def insert() -> dict[str, Any]:
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO workers (id, name, model, capabilities, status)
+                    VALUES (%s, %s, %s, %s::jsonb, 'ready')
+                    RETURNING id, name, model, capabilities, status,
+                              last_heartbeat, created_at
+                    """,
+                    (worker_id, name, model, json.dumps(capabilities)),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        assert row is not None
+        return _serialize_row(
+            row,
+            ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"],
+        )
+
+    result = await asyncio.to_thread(insert)
+    await redis.xadd(
+        "ctf:events",
+        {
+            "type": "worker_registered",
+            "worker_id": result["id"],
+            "model": result["model"],
+        },
+        maxlen=10000,
+        approximate=True,
+    )
+    return result
+
+
+async def heartbeat_worker(database_url: str, worker_id: str, status: str = "ready") -> bool:
+    now = datetime.now(timezone.utc)
+
+    def update() -> bool:
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE workers
+                    SET status = %s, last_heartbeat = %s
+                    WHERE id = %s
+                    """,
+                    (status, now, worker_id),
+                )
+                changed = cur.rowcount > 0
+            conn.commit()
+        return changed
+
+    return await asyncio.to_thread(update)
+
+
+async def list_workers(database_url: str) -> list[dict[str, Any]]:
+    def fetch() -> list[dict[str, Any]]:
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, model, capabilities, status,
+                           last_heartbeat, created_at
+                    FROM workers
+                    ORDER BY created_at ASC
+                    """
+                )
+                rows = cur.fetchall()
+        return [
+            _serialize_row(
+                row,
+                ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"],
+            )
+            for row in rows
+        ]
 
     return await asyncio.to_thread(fetch)
