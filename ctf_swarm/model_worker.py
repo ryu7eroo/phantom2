@@ -12,6 +12,8 @@ from .agent import AgentContext
 from .distributed_blackboard import DistributedBlackboard
 from .models import Challenge, Evidence, Round
 from .openai_compatible_provider import OpenAICompatibleProvider
+from .sandbox_tool_gateway import DockerSandboxToolGateway
+from .tool_loop import solve_with_tools
 
 
 def build_prompt(fields: dict[str, str], snapshot: dict[str, object]) -> str:
@@ -89,6 +91,7 @@ def parse_response(text: str, worker_id: str, task_id: str, round_name: str) -> 
 async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
     redis = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
     provider = OpenAICompatibleProvider(model=model, base_url=base_url)
+    gateway = DockerSandboxToolGateway(enabled=os.getenv("CTF_TOOLS_ENABLED", "1") == "1")
     stream = f"ctf:worker:{worker_id}"
     last_id = "0-0"
     try:
@@ -127,27 +130,34 @@ async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
                             next_hypotheses=_tuple_field(item, "next_hypotheses"),
                         ))
 
-                    explored_paths = frozenset(str(x) for x in snapshot.get("explored_paths", []))
-                    open_hypotheses = frozenset(str(x) for x in snapshot.get("open_hypotheses", []))
                     context = AgentContext(
-                        challenge=Challenge(id=task_id, title=fields.get("title", ""), category=fields.get("category", "misc"), points=int(fields.get("points", "0"))),
+                        challenge=Challenge(
+                            id=task_id,
+                            title=fields.get("title", ""),
+                            category=fields.get("category", "misc"),
+                            points=int(fields.get("points", "0")),
+                        ),
                         round=current_round,
                         dead_ends=frozenset(str(x) for x in snapshot.get("dead_ends", [])),
-                        explored_paths=explored_paths,
-                        open_hypotheses=open_hypotheses,
+                        explored_paths=frozenset(str(x) for x in snapshot.get("explored_paths", [])),
+                        open_hypotheses=frozenset(str(x) for x in snapshot.get("open_hypotheses", [])),
                         evidence=tuple(evidence_items[-12:]),
                     )
 
                     pubsub = redis.pubsub()
                     await pubsub.subscribe(f"ctf:cancel:{task_id}")
-                    solve_task = asyncio.create_task(provider.generate(context, build_prompt(fields, snapshot)))
+                    solve_task = asyncio.create_task(
+                        solve_with_tools(provider, context, build_prompt(fields, snapshot), gateway)
+                    )
                     cancel_task = asyncio.create_task(pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1))
                     try:
                         while True:
                             done, _ = await asyncio.wait({solve_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
                             if solve_task in done:
-                                result = solve_task.result()
+                                result, transcript = solve_task.result()
                                 event = parse_response(result.text, worker_id, task_id, round_name)
+                                if transcript:
+                                    event["tool_trace"] = json.dumps(transcript[-8:])
                                 await redis.xadd("ctf:events", event, maxlen=10000, approximate=True)
                                 print(f"[model-worker {worker_id}] emitted {event['type']} task={task_id} round={round_name}", flush=True)
                                 break
