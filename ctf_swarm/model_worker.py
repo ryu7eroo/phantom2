@@ -19,14 +19,9 @@ def build_prompt(fields: dict[str, str], snapshot: dict[str, object]) -> str:
     history = snapshot.get("history", [])
     dead_ends = snapshot.get("dead_ends", [])
     open_hypotheses = snapshot.get("open_hypotheses", [])
-
-    if round_name in {Round.INDEPENDENT.value, Round.COLLABORATIVE.value}:
-        thinking = "/no_think"
-    else:
-        thinking = "/think"
-
+    thinking = "/no_think" if round_name in {Round.INDEPENDENT.value, Round.COLLABORATIVE.value} else "/think"
     return (
-        "Solve the following CTF challenge. Work systematically and use the shared evidence.\n"
+        "Solve the following CTF challenge. Work systematically and use shared evidence.\n"
         f"Title: {fields.get('title', '')}\n"
         f"Category: {fields.get('category', '')}\n"
         f"Round: {round_name}\n"
@@ -34,11 +29,24 @@ def build_prompt(fields: dict[str, str], snapshot: dict[str, object]) -> str:
         f"Known dead ends: {json.dumps(dead_ends)}\n"
         f"Open hypotheses: {json.dumps(open_hypotheses)}\n"
         f"Shared evidence history: {json.dumps(history[-12:])}\n\n"
-        "Do not repeat a known dead end. In collaborative rounds, explicitly build on useful prior evidence. "
-        "In divergent rounds, choose a materially different approach from the known paths. "
+        "Do not repeat a known dead end. In collaborative rounds, build on useful prior evidence. "
+        "In divergent rounds, choose a materially different approach from known paths. "
         "Return a concise hypothesis/evidence report or a verified flag candidate.\n"
         f"Use {thinking}."
     )
+
+
+def _tuple_field(item: dict[str, object], key: str) -> tuple[str, ...]:
+    value = item.get(key, ())
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            value = decoded
+        except json.JSONDecodeError:
+            return (value,)
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(x) for x in value)
+    return ()
 
 
 def parse_response(text: str, worker_id: str, task_id: str, round_name: str) -> dict[str, object]:
@@ -49,15 +57,8 @@ def parse_response(text: str, worker_id: str, task_id: str, round_name: str) -> 
         end = stripped.find("}", start)
         if end != -1:
             value = stripped[start : end + 1]
-            return {
-                "type": "candidate",
-                "task_id": task_id,
-                "worker_id": worker_id,
-                "value": value,
-                "proof": f"model-response:{worker_id}:{time.time_ns()}",
-            }
-
-    payload = {
+            return {"type": "candidate", "task_id": task_id, "worker_id": worker_id, "value": value, "proof": f"model-response:{worker_id}:{time.time_ns()}"}
+    return {
         "type": "evidence",
         "task_id": task_id,
         "worker_id": worker_id,
@@ -69,12 +70,10 @@ def parse_response(text: str, worker_id: str, task_id: str, round_name: str) -> 
         "next_hypotheses": json.dumps([]),
         "confidence": "0.30",
     }
-    return payload
 
 
 async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    redis = Redis.from_url(redis_url, decode_responses=True)
+    redis = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
     provider = OpenAICompatibleProvider(model=model, base_url=base_url)
     stream = f"ctf:worker:{worker_id}"
     last_id = "0-0"
@@ -97,63 +96,53 @@ async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
                         current_round = Round.INDEPENDENT
                         round_name = current_round.value
 
-                    board = DistributedBlackboard(redis, task_id, round_name)
-                    snapshot = await board.snapshot()
-                    evidence_items = []
+                    snapshot = await DistributedBlackboard(redis, task_id, round_name).snapshot()
+                    evidence_items: list[Evidence] = []
                     for item in snapshot.get("history", []):
-                        evidence_items.append(
-                            Evidence(
-                                agent_id=str(item.get("agent_id", "unknown")),
-                                challenge_id=task_id,
-                                claim=str(item.get("claim", "")),
-                                evidence=tuple(item.get("evidence", ())) if isinstance(item.get("evidence"), list) else (),
-                                failed_paths=tuple(item.get("failed_paths", ())) if isinstance(item.get("failed_paths"), list) else (),
-                                confidence=float(item.get("confidence", 0.0)),
-                                round=Round(str(item.get("round", Round.INDEPENDENT.value))),
-                            )
-                        )
+                        if not isinstance(item, dict):
+                            continue
+                        evidence_items.append(Evidence(
+                            agent_id=str(item.get("agent_id", "unknown")),
+                            challenge_id=task_id,
+                            claim=str(item.get("claim", "")),
+                            evidence=_tuple_field(item, "evidence"),
+                            failed_paths=_tuple_field(item, "failed_paths"),
+                            confidence=float(item.get("confidence", 0.0) or 0.0),
+                            round=Round(str(item.get("round", Round.INDEPENDENT.value))),
+                            tested_paths=_tuple_field(item, "tested_paths"),
+                            next_hypotheses=_tuple_field(item, "next_hypotheses"),
+                        ))
 
+                    explored_paths = frozenset(path for item in evidence_items for path in item.tested_paths)
+                    open_hypotheses = frozenset(str(x) for x in snapshot.get("open_hypotheses", []))
                     context = AgentContext(
-                        challenge=Challenge(
-                            id=task_id,
-                            title=fields.get("title", ""),
-                            category=fields.get("category", "misc"),
-                            points=int(fields.get("points", "0")),
-                        ),
+                        challenge=Challenge(id=task_id, title=fields.get("title", ""), category=fields.get("category", "misc"), points=int(fields.get("points", "0"))),
                         round=current_round,
                         dead_ends=frozenset(str(x) for x in snapshot.get("dead_ends", [])),
+                        explored_paths=explored_paths,
+                        open_hypotheses=open_hypotheses,
                         evidence=tuple(evidence_items[-12:]),
                     )
 
                     pubsub = redis.pubsub()
                     await pubsub.subscribe(f"ctf:cancel:{task_id}")
-                    solve_task = asyncio.create_task(
-                        provider.generate(context, build_prompt(fields, snapshot))
-                    )
-                    cancel_task = asyncio.create_task(
-                        pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
-                    )
+                    solve_task = asyncio.create_task(provider.generate(context, build_prompt(fields, snapshot)))
+                    cancel_task = asyncio.create_task(pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1))
                     try:
                         while True:
-                            done, _ = await asyncio.wait(
-                                {solve_task, cancel_task},
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
+                            done, _ = await asyncio.wait({solve_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
                             if solve_task in done:
                                 result = solve_task.result()
                                 event = parse_response(result.text, worker_id, task_id, round_name)
                                 await redis.xadd("ctf:events", event, maxlen=10000, approximate=True)
                                 print(f"[model-worker {worker_id}] emitted {event['type']} task={task_id} round={round_name}", flush=True)
                                 break
-
-                            cancel_task = asyncio.create_task(
-                                pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
-                            )
-                            message = next(iter(done)).result()
+                            message = cancel_task.result()
                             if message and message.get("channel") == f"ctf:cancel:{task_id}":
                                 solve_task.cancel()
                                 print(f"[model-worker {worker_id}] CANCELLED task={task_id}", flush=True)
                                 break
+                            cancel_task = asyncio.create_task(pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5))
                     finally:
                         if not solve_task.done():
                             solve_task.cancel()
