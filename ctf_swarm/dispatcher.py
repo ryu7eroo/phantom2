@@ -6,14 +6,7 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
-from .persistence import (
-    claim_task,
-    create_assignment,
-    get_task,
-    list_eligible_workers,
-    list_queued_tasks,
-    mark_task_solved,
-)
+from .persistence import claim_task, create_assignment, get_task, list_eligible_workers, list_queued_tasks, mark_task_solved
 
 
 @dataclass(frozen=True)
@@ -70,15 +63,7 @@ class Dispatcher:
             assignments.append(Assignment(**assignment))
             await self.redis.xadd(
                 f"ctf:worker:{worker['id']}",
-                {
-                    "type": "assignment_created",
-                    "assignment_id": assignment["assignment_id"],
-                    "task_id": task_id,
-                    "round": str(task["round"]),
-                    "category": str(task["category"]),
-                    "title": str(task["title"]),
-                    "points": str(task["points"]),
-                },
+                {"type": "assignment_created", "assignment_id": assignment["assignment_id"], "task_id": task_id, "round": str(task["round"]), "category": str(task["category"]), "title": str(task["title"]), "points": str(task["points"])},
                 maxlen=1000,
                 approximate=True,
             )
@@ -96,8 +81,7 @@ class Dispatcher:
         worker_id = event.get("worker_id")
         if not value or not proof or not task_id or not worker_id:
             return False
-        won = await mark_task_solved(self.database_url, self.redis, UUID(task_id), worker_id, value)
-        return won
+        return await mark_task_solved(self.database_url, self.redis, UUID(task_id), worker_id, value)
 
     async def consume_once(self) -> int:
         await self.ensure_group()
@@ -112,8 +96,7 @@ class Dispatcher:
                 elif event_type == "worker_registered":
                     await self.dispatch_queued()
                 elif event_type == "candidate":
-                    if await self.handle_candidate(event):
-                        await self.emit_cancel(event["task_id"], "verified")
+                    await self.handle_candidate(event)
                 elif event_type == "verified":
                     await self.emit_cancel(event["task_id"], "verified")
                 await self.redis.xack(self.stream, self.group, message_id)
