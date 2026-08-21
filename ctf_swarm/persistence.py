@@ -124,6 +124,31 @@ async def claim_task(database_url: str, task_id: UUID, status: str) -> bool:
     return await asyncio.to_thread(claim)
 
 
+async def advance_task_round(database_url: str, redis: Redis, task_id: UUID, expected_round: str, next_round: str) -> bool:
+    now = datetime.now(timezone.utc)
+
+    def advance() -> bool:
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE tasks SET status = 'queued', round = %s, updated_at = %s WHERE id = %s AND status = 'dispatched' AND round = %s",
+                    (next_round, now, task_id, expected_round),
+                )
+                changed = cur.rowcount == 1
+            conn.commit()
+        return changed
+
+    changed = await asyncio.to_thread(advance)
+    if changed:
+        await redis.xadd(
+            "ctf:events",
+            {"type": "round_advanced", "task_id": str(task_id), "from_round": expected_round, "to_round": next_round},
+            maxlen=10000,
+            approximate=True,
+        )
+    return changed
+
+
 async def mark_task_solved(database_url: str, redis: Redis, task_id: UUID, worker_id: str, value: str) -> bool:
     now = datetime.now(timezone.utc)
     def mark() -> bool:
