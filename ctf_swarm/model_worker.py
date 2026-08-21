@@ -44,8 +44,8 @@ def build_prompt(fields: dict[str, str], snapshot: dict[str, object]) -> str:
         f"Explored paths: {json.dumps(explored_paths)}\n"
         f"Open hypotheses: {json.dumps(open_hypotheses)}\n"
         f"Shared evidence history: {json.dumps(history[-12:])}\n\n"
-        "Do not fabricate challenge data that was not provided. Distinguish hypotheses from verified facts. "
-        "Return a concise evidence report, critique, or verified flag candidate.\n"
+        "Avoid repeating known dead ends. Do not fabricate challenge data that was not provided. "
+        "Distinguish hypotheses from verified facts. Return a concise evidence report, critique, or verified flag candidate.\n"
         f"Use {thinking}."
     )
 
