@@ -6,7 +6,13 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
-from .persistence import claim_task, create_assignment, get_task, list_eligible_workers
+from .persistence import (
+    claim_task,
+    create_assignment,
+    get_task,
+    list_eligible_workers,
+    list_queued_tasks,
+)
 
 
 @dataclass(frozen=True)
@@ -17,7 +23,7 @@ class Assignment:
 
 
 class Dispatcher:
-    """Redis-stream driven dispatcher with atomic task claiming."""
+    """Redis-stream driven dispatcher with atomic task claiming and queue recovery."""
 
     def __init__(self, redis: Redis, database_url: str) -> None:
         self.redis = redis
@@ -47,13 +53,26 @@ class Dispatcher:
         if not claimed:
             return []
 
+        return await self._create_assignments(task, workers)
+
+    async def dispatch_queued(self, category: str | None = None) -> int:
+        tasks = await list_queued_tasks(self.database_url, category)
+        dispatched = 0
+        for task in tasks:
+            assignments = await self.dispatch_task(task["id"])
+            if assignments:
+                dispatched += 1
+        return dispatched
+
+    async def _create_assignments(self, task: dict[str, object], workers: list[dict[str, object]]) -> list[Assignment]:
+        task_id = str(task["id"])
         assignments: list[Assignment] = []
         for worker in workers:
             assignment = await create_assignment(
                 self.database_url,
                 UUID(task_id),
-                worker["id"],
-                task["round"],
+                str(worker["id"]),
+                str(task["round"]),
             )
             assignments.append(Assignment(**assignment))
             await self.redis.xadd(
@@ -62,14 +81,15 @@ class Dispatcher:
                     "type": "assignment_created",
                     "assignment_id": assignment["assignment_id"],
                     "task_id": task_id,
-                    "round": task["round"],
-                    "category": task["category"],
-                    "title": task["title"],
+                    "round": str(task["round"]),
+                    "category": str(task["category"]),
+                    "title": str(task["title"]),
                     "points": str(task["points"]),
                 },
                 maxlen=1000,
                 approximate=True,
             )
+
         await self.redis.xadd(
             self.stream,
             {
@@ -110,6 +130,8 @@ class Dispatcher:
                 event_type = event.get("type")
                 if event_type == "task_created":
                     await self.dispatch_task(event["task_id"])
+                elif event_type == "worker_registered":
+                    await self.dispatch_queued()
                 elif event_type == "verified":
                     await self.emit_cancel(event["task_id"], "verified")
                 await self.redis.xack(self.stream, self.group, message_id)
