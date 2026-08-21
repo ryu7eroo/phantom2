@@ -10,7 +10,7 @@ from .model_provider import ModelResponse
 
 
 class OpenAICompatibleProvider:
-    """Provider for vLLM/SGLang/other OpenAI-compatible inference servers."""
+    """Provider for vLLM/SGLang/llama.cpp OpenAI-compatible servers."""
 
     def __init__(
         self,
@@ -18,12 +18,14 @@ class OpenAICompatibleProvider:
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float = 300.0,
+        max_tokens: int = 4096,
     ) -> None:
         self.name = model
         self.model = model
         self.base_url = (base_url or os.getenv("MODEL_BASE_URL", "http://127.0.0.1:8001/v1")).rstrip("/")
         self.api_key = api_key or os.getenv("MODEL_API_KEY", "EMPTY")
         self.timeout = timeout
+        self.max_tokens = max_tokens
 
     @staticmethod
     def _system_context(context: AgentContext) -> str:
@@ -47,6 +49,7 @@ class OpenAICompatibleProvider:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
+            "max_tokens": self.max_tokens,
         }
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
@@ -55,8 +58,19 @@ class OpenAICompatibleProvider:
 
         choice = data["choices"][0]
         message = choice.get("message", {})
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        # Qwen3/llama.cpp can place all useful output in reasoning_content when the
+        # generation budget is exhausted while thinking. Preserve it for the worker
+        # instead of returning an apparently empty response.
+        text = str(content or reasoning)
         return ModelResponse(
-            text=str(message.get("content", "")),
+            text=text,
             tool_calls=tuple(message.get("tool_calls") or ()),
-            metadata={"model": self.model, "usage": data.get("usage", {})},
+            metadata={
+                "model": self.model,
+                "usage": data.get("usage", {}),
+                "reasoning_content": reasoning,
+                "finish_reason": choice.get("finish_reason"),
+            },
         )
