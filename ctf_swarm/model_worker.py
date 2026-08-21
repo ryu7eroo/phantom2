@@ -18,20 +18,34 @@ def build_prompt(fields: dict[str, str], snapshot: dict[str, object]) -> str:
     round_name = fields.get("round", Round.INDEPENDENT.value)
     history = snapshot.get("history", [])
     dead_ends = snapshot.get("dead_ends", [])
+    explored_paths = snapshot.get("explored_paths", [])
     open_hypotheses = snapshot.get("open_hypotheses", [])
-    thinking = "/no_think" if round_name in {Round.INDEPENDENT.value, Round.COLLABORATIVE.value} else "/think"
+
+    if round_name in {Round.INDEPENDENT.value, Round.COLLABORATIVE.value}:
+        thinking = "/no_think"
+    else:
+        thinking = "/think"
+
+    role_instruction = {
+        Round.INDEPENDENT.value: "Work independently. Establish concrete observations and the most likely attack surface.",
+        Round.COLLABORATIVE.value: "Synthesize the shared evidence. Resolve contradictions and extend the strongest useful lead.",
+        Round.DIVERGENT.value: "Deliberately pursue a materially different path from explored/dead paths. Do not merely rename an existing hypothesis.",
+        Round.ADVERSARIAL.value: "Act as an adversarial critic. Try to falsify the leading hypotheses, identify unsupported assumptions, and only propose a candidate when it has evidence.",
+    }.get(round_name, "Analyze the task systematically.")
+
     return (
-        "Solve the following CTF challenge. Work systematically and use shared evidence.\n"
+        "You are a CTF security research agent.\n"
+        f"{role_instruction}\n\n"
         f"Title: {fields.get('title', '')}\n"
         f"Category: {fields.get('category', '')}\n"
         f"Round: {round_name}\n"
         f"Points: {fields.get('points', '0')}\n\n"
         f"Known dead ends: {json.dumps(dead_ends)}\n"
+        f"Explored paths: {json.dumps(explored_paths)}\n"
         f"Open hypotheses: {json.dumps(open_hypotheses)}\n"
         f"Shared evidence history: {json.dumps(history[-12:])}\n\n"
-        "Do not repeat a known dead end. In collaborative rounds, build on useful prior evidence. "
-        "In divergent rounds, choose a materially different approach from known paths. "
-        "Return a concise hypothesis/evidence report or a verified flag candidate.\n"
+        "Do not fabricate challenge data that was not provided. Distinguish hypotheses from verified facts. "
+        "Return a concise evidence report, critique, or verified flag candidate.\n"
         f"Use {thinking}."
     )
 
@@ -113,7 +127,7 @@ async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
                             next_hypotheses=_tuple_field(item, "next_hypotheses"),
                         ))
 
-                    explored_paths = frozenset(path for item in evidence_items for path in item.tested_paths)
+                    explored_paths = frozenset(str(x) for x in snapshot.get("explored_paths", []))
                     open_hypotheses = frozenset(str(x) for x in snapshot.get("open_hypotheses", []))
                     context = AgentContext(
                         challenge=Challenge(id=task_id, title=fields.get("title", ""), category=fields.get("category", "misc"), points=int(fields.get("points", "0"))),
