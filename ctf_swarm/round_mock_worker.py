@@ -83,25 +83,65 @@ async def run(policy: WorkerPolicy) -> None:
                         f"history={len(board['history'])} dead={len(board['dead_ends'])} open={len(board['open_hypotheses'])}",
                         flush=True,
                     )
-                    await asyncio.sleep(policy.delay)
-                    if round_name == "divergent" and policy.mode == "B":
-                        proof = f"round3-proof:{policy.worker_id}:{time.time_ns()}"
-                        await redis.xadd(
-                            "ctf:events",
-                            {
-                                "type": "candidate",
-                                "task_id": task_id,
-                                "worker_id": policy.worker_id,
-                                "value": "LISA{distributed-round-win}",
-                                "proof": proof,
-                            },
-                            maxlen=10000,
-                            approximate=True,
-                        )
-                        print(f"[round-worker {policy.worker_id}] CANDIDATE round={round_name}", flush=True)
-                    else:
-                        await publish_evidence(redis, task_id, policy, round_name)
-                        print(f"[round-worker {policy.worker_id}] EVIDENCE round={round_name}", flush=True)
+
+                    pubsub = redis.pubsub()
+                    await pubsub.subscribe(f"ctf:cancel:{task_id}")
+                    solve_task = asyncio.create_task(asyncio.sleep(policy.delay))
+                    cancel_task = asyncio.create_task(
+                        pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+                    )
+                    try:
+                        while True:
+                            done, _ = await asyncio.wait(
+                                {solve_task, cancel_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if solve_task in done:
+                                if round_name == "divergent" and policy.mode == "B":
+                                    proof = f"round3-proof:{policy.worker_id}:{time.time_ns()}"
+                                    await redis.xadd(
+                                        "ctf:events",
+                                        {
+                                            "type": "candidate",
+                                            "task_id": task_id,
+                                            "worker_id": policy.worker_id,
+                                            "value": "LISA{distributed-round-win}",
+                                            "proof": proof,
+                                        },
+                                        maxlen=10000,
+                                        approximate=True,
+                                    )
+                                    print(
+                                        f"[round-worker {policy.worker_id}] CANDIDATE round={round_name}",
+                                        flush=True,
+                                    )
+                                else:
+                                    await publish_evidence(redis, task_id, policy, round_name)
+                                    print(
+                                        f"[round-worker {policy.worker_id}] EVIDENCE round={round_name}",
+                                        flush=True,
+                                    )
+                                break
+
+                            message = next(iter(done)).result()
+                            if message and message.get("channel") == f"ctf:cancel:{task_id}":
+                                solve_task.cancel()
+                                print(
+                                    f"[round-worker {policy.worker_id}] CANCELLED task={task_id}",
+                                    flush=True,
+                                )
+                                break
+                            cancel_task = asyncio.create_task(
+                                pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
+                            )
+                    finally:
+                        if not solve_task.done():
+                            solve_task.cancel()
+                        if not cancel_task.done():
+                            cancel_task.cancel()
+                        await asyncio.gather(solve_task, cancel_task, return_exceptions=True)
+                        await pubsub.unsubscribe(f"ctf:cancel:{task_id}")
+                        await pubsub.aclose()
     finally:
         await redis.aclose()
 
