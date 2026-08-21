@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -19,11 +16,8 @@ class Assignment:
     assignment_id: str
 
 
-EventHandler = Callable[[dict[str, str]], Awaitable[None]]
-
-
 class Dispatcher:
-    """Redis-stream driven dispatcher with cancellation-by-event semantics."""
+    """Redis-stream driven dispatcher with atomic task claiming."""
 
     def __init__(self, redis: Redis, database_url: str) -> None:
         self.redis = redis
@@ -49,7 +43,10 @@ class Dispatcher:
         if not workers:
             return []
 
-        await claim_task(self.database_url, UUID(task_id), "dispatched")
+        claimed = await claim_task(self.database_url, UUID(task_id), "dispatched")
+        if not claimed:
+            return []
+
         assignments: list[Assignment] = []
         for worker in workers:
             assignment = await create_assignment(
@@ -73,6 +70,16 @@ class Dispatcher:
                 maxlen=1000,
                 approximate=True,
             )
+        await self.redis.xadd(
+            self.stream,
+            {
+                "type": "task_dispatched",
+                "task_id": task_id,
+                "assignment_count": str(len(assignments)),
+            },
+            maxlen=10000,
+            approximate=True,
+        )
         return assignments
 
     async def emit_cancel(self, task_id: str, reason: str = "global_solved") -> None:
