@@ -9,7 +9,7 @@ from .models import Evidence, Round
 
 
 class DistributedBlackboard:
-    """Redis-backed evidence, history, and round barrier for distributed workers."""
+    """Redis-backed evidence, task-wide search memory, and round barrier."""
 
     def __init__(self, redis: Redis, task_id: str, round_name: str) -> None:
         self.redis = redis
@@ -18,8 +18,8 @@ class DistributedBlackboard:
         self.prefix = f"ctf:bb:{task_id}:{round_name}"
         self.pending_key = f"{self.prefix}:pending"
         self.evidence_key = f"{self.prefix}:evidence"
-        self.dead_key = f"{self.prefix}:dead"
-        self.open_key = f"{self.prefix}:open"
+        self.task_dead_key = f"ctf:bb:{task_id}:dead"
+        self.task_open_key = f"ctf:bb:{task_id}:open"
         self.history_key = f"ctf:bb:{task_id}:history"
 
     async def register_workers(self, worker_ids: list[str]) -> None:
@@ -33,9 +33,9 @@ class DistributedBlackboard:
         await self.redis.hset(self.evidence_key, evidence.agent_id, encoded)
         await self.redis.rpush(self.history_key, encoded)
         if evidence.failed_paths:
-            await self.redis.sadd(self.dead_key, *evidence.failed_paths)
+            await self.redis.sadd(self.task_dead_key, *evidence.failed_paths)
         if evidence.next_hypotheses:
-            await self.redis.sadd(self.open_key, *evidence.next_hypotheses)
+            await self.redis.sadd(self.task_open_key, *evidence.next_hypotheses)
         await self.redis.srem(self.pending_key, evidence.agent_id)
         return await self.redis.scard(self.pending_key) == 0
 
@@ -49,14 +49,14 @@ class DistributedBlackboard:
             "round": self.round,
             "evidence": current_round_evidence,
             "history": history,
-            "dead_ends": sorted(await self.redis.smembers(self.dead_key)),
-            "open_hypotheses": sorted(await self.redis.smembers(self.open_key)),
+            "dead_ends": sorted(await self.redis.smembers(self.task_dead_key)),
+            "open_hypotheses": sorted(await self.redis.smembers(self.task_open_key)),
             "pending_workers": sorted(await self.redis.smembers(self.pending_key)),
         }
 
     async def clear(self) -> None:
-        # Round-local barrier state can be cleared; task-wide history is retained.
-        await self.redis.delete(self.pending_key, self.evidence_key, self.dead_key, self.open_key)
+        # Only round-local barrier/evidence state is removed. Search memory is task-wide.
+        await self.redis.delete(self.pending_key, self.evidence_key)
 
 
 ROUND_SEQUENCE = [Round.INDEPENDENT, Round.COLLABORATIVE, Round.DIVERGENT]
