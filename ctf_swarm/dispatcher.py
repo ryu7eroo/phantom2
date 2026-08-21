@@ -17,9 +17,10 @@ from .persistence import (
 
 @dataclass(frozen=True)
 class Assignment:
+    assignment_id: str
     task_id: str
     worker_id: str
-    assignment_id: str
+    round: str
 
 
 class Dispatcher:
@@ -64,7 +65,11 @@ class Dispatcher:
                 dispatched += 1
         return dispatched
 
-    async def _create_assignments(self, task: dict[str, object], workers: list[dict[str, object]]) -> list[Assignment]:
+    async def _create_assignments(
+        self,
+        task: dict[str, object],
+        workers: list[dict[str, object]],
+    ) -> list[Assignment]:
         task_id = str(task["id"])
         assignments: list[Assignment] = []
         for worker in workers:
@@ -74,7 +79,8 @@ class Dispatcher:
                 str(worker["id"]),
                 str(task["round"]),
             )
-            assignments.append(Assignment(**assignment))
+            typed_assignment = Assignment(**assignment)
+            assignments.append(typed_assignment)
             await self.redis.xadd(
                 f"ctf:worker:{worker['id']}",
                 {
@@ -136,6 +142,10 @@ class Dispatcher:
                     await self.emit_cancel(event["task_id"], "verified")
                 await self.redis.xack(self.stream, self.group, message_id)
                 handled += 1
+
+        # Recover queued tasks after a dispatcher restart even when the original
+        # task_created event was already acknowledged before a worker was ready.
+        await self.dispatch_queued()
         return handled
 
     async def run_forever(self) -> None:
