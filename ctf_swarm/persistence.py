@@ -9,7 +9,6 @@ from uuid import UUID, uuid4
 import psycopg
 from redis.asyncio import Redis
 
-
 CREATE_TASKS_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id UUID PRIMARY KEY,
@@ -18,6 +17,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     points INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'queued',
     round TEXT NOT NULL DEFAULT 'independent',
+    solved_value TEXT,
+    solved_by TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
@@ -64,6 +65,8 @@ async def init_database(database_url: str) -> None:
                 cur.execute(CREATE_TASKS_SQL)
                 cur.execute(CREATE_WORKERS_SQL)
                 cur.execute(CREATE_ASSIGNMENTS_SQL)
+                cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS solved_value TEXT")
+                cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS solved_by TEXT")
             conn.commit()
 
     await asyncio.to_thread(create)
@@ -79,24 +82,19 @@ async def create_task(database_url: str, redis: Redis, title: str, category: str
                     """
                     INSERT INTO tasks (id, title, category, points)
                     VALUES (%s, %s, %s, %s)
-                    RETURNING id, title, category, points, status, round, created_at, updated_at
+                    RETURNING id, title, category, points, status, round, solved_value, solved_by, created_at, updated_at
                     """,
                     (task_id, title, category, points),
                 )
                 row = cur.fetchone()
             conn.commit()
         assert row is not None
-        result = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "created_at", "updated_at"])
+        result = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "solved_value", "solved_by", "created_at", "updated_at"])
         result["id"] = str(result["id"])
         return result
 
     result = await asyncio.to_thread(insert)
-    await redis.xadd(
-        "ctf:events",
-        {"type": "task_created", "task_id": result["id"], "category": result["category"], "points": str(result["points"])},
-        maxlen=10000,
-        approximate=True,
-    )
+    await redis.xadd("ctf:events", {"type": "task_created", "task_id": result["id"], "category": result["category"], "points": str(result["points"])}, maxlen=10000, approximate=True)
     return result
 
 
@@ -104,69 +102,62 @@ async def get_task(database_url: str, task_id: UUID) -> dict[str, Any] | None:
     def fetch() -> dict[str, Any] | None:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, title, category, points, status, round, created_at, updated_at FROM tasks WHERE id = %s",
-                    (task_id,),
-                )
+                cur.execute("SELECT id, title, category, points, status, round, solved_value, solved_by, created_at, updated_at FROM tasks WHERE id = %s", (task_id,))
                 row = cur.fetchone()
         if row is None:
             return None
-        result = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "created_at", "updated_at"])
+        result = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "solved_value", "solved_by", "created_at", "updated_at"])
         result["id"] = str(result["id"])
         return result
-
     return await asyncio.to_thread(fetch)
 
 
 async def claim_task(database_url: str, task_id: UUID, status: str) -> bool:
     now = datetime.now(timezone.utc)
-
     def claim() -> bool:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE tasks SET status = %s, updated_at = %s WHERE id = %s AND status = 'queued'",
-                    (status, now, task_id),
-                )
+                cur.execute("UPDATE tasks SET status = %s, updated_at = %s WHERE id = %s AND status = 'queued'", (status, now, task_id))
                 changed = cur.rowcount == 1
             conn.commit()
         return changed
-
     return await asyncio.to_thread(claim)
+
+
+async def mark_task_solved(database_url: str, redis: Redis, task_id: UUID, worker_id: str, value: str) -> bool:
+    now = datetime.now(timezone.utc)
+    def mark() -> bool:
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE tasks SET status = 'solved', solved_value = %s, solved_by = %s, updated_at = %s WHERE id = %s AND status NOT IN ('solved', 'cancelled')", (value, worker_id, now, task_id))
+                changed = cur.rowcount == 1
+                if changed:
+                    cur.execute("UPDATE assignments SET status = 'cancelled', updated_at = %s WHERE task_id = %s AND status = 'assigned'", (now, task_id))
+            conn.commit()
+        return changed
+    won = await asyncio.to_thread(mark)
+    if won:
+        await redis.xadd("ctf:events", {"type": "verified", "task_id": str(task_id), "worker_id": worker_id, "value": value}, maxlen=10000, approximate=True)
+    return won
 
 
 async def register_worker(database_url: str, redis: Redis, name: str, model: str, capabilities: dict[str, Any]) -> dict[str, Any]:
     worker_id = str(uuid4())
-
     def insert() -> dict[str, Any]:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO workers (id, name, model, capabilities, status)
-                    VALUES (%s, %s, %s, %s::jsonb, 'ready')
-                    RETURNING id, name, model, capabilities, status, last_heartbeat, created_at
-                    """,
-                    (worker_id, name, model, json.dumps(capabilities)),
-                )
+                cur.execute("INSERT INTO workers (id, name, model, capabilities, status) VALUES (%s, %s, %s, %s::jsonb, 'ready') RETURNING id, name, model, capabilities, status, last_heartbeat, created_at", (worker_id, name, model, json.dumps(capabilities)))
                 row = cur.fetchone()
             conn.commit()
         assert row is not None
         return _serialize_row(row, ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"])
-
     result = await asyncio.to_thread(insert)
-    await redis.xadd(
-        "ctf:events",
-        {"type": "worker_registered", "worker_id": result["id"], "model": result["model"]},
-        maxlen=10000,
-        approximate=True,
-    )
+    await redis.xadd("ctf:events", {"type": "worker_registered", "worker_id": result["id"], "model": result["model"]}, maxlen=10000, approximate=True)
     return result
 
 
 async def heartbeat_worker(database_url: str, worker_id: str, status: str = "ready") -> bool:
     now = datetime.now(timezone.utc)
-
     def update() -> bool:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
@@ -174,7 +165,6 @@ async def heartbeat_worker(database_url: str, worker_id: str, status: str = "rea
                 changed = cur.rowcount > 0
             conn.commit()
         return changed
-
     return await asyncio.to_thread(update)
 
 
@@ -185,30 +175,17 @@ async def list_workers(database_url: str) -> list[dict[str, Any]]:
                 cur.execute("SELECT id, name, model, capabilities, status, last_heartbeat, created_at FROM workers ORDER BY created_at ASC")
                 rows = cur.fetchall()
         return [_serialize_row(row, ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"]) for row in rows]
-
     return await asyncio.to_thread(fetch)
 
 
 async def list_eligible_workers(database_url: str, category: str) -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=45)
-
     def fetch() -> list[dict[str, Any]]:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, name, model, capabilities, status, last_heartbeat, created_at
-                    FROM workers
-                    WHERE status = 'ready'
-                      AND last_heartbeat >= %s
-                      AND (capabilities->'categories' IS NULL OR capabilities->'categories' @> %s::jsonb)
-                    ORDER BY created_at ASC
-                    """,
-                    (cutoff, json.dumps([category])),
-                )
+                cur.execute("SELECT id, name, model, capabilities, status, last_heartbeat, created_at FROM workers WHERE status = 'ready' AND last_heartbeat >= %s AND (capabilities->'categories' IS NULL OR capabilities->'categories' @> %s::jsonb) ORDER BY created_at ASC", (cutoff, json.dumps([category])))
                 rows = cur.fetchall()
         return [_serialize_row(row, ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"]) for row in rows]
-
     return await asyncio.to_thread(fetch)
 
 
@@ -216,45 +193,31 @@ async def list_queued_tasks(database_url: str, category: str | None = None) -> l
     def fetch() -> list[dict[str, Any]]:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                if category is None:
-                    cur.execute(
-                        "SELECT id, title, category, points, status, round, created_at, updated_at FROM tasks WHERE status = 'queued' ORDER BY created_at ASC"
-                    )
-                else:
-                    cur.execute(
-                        "SELECT id, title, category, points, status, round, created_at, updated_at FROM tasks WHERE status = 'queued' AND category = %s ORDER BY created_at ASC",
-                        (category,),
-                    )
+                query = "SELECT id, title, category, points, status, round, solved_value, solved_by, created_at, updated_at FROM tasks WHERE status = 'queued'"
+                params: tuple[Any, ...] = ()
+                if category is not None:
+                    query += " AND category = %s"
+                    params = (category,)
+                query += " ORDER BY created_at ASC"
+                cur.execute(query, params)
                 rows = cur.fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
-            item = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "created_at", "updated_at"])
+            item = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "solved_value", "solved_by", "created_at", "updated_at"])
             item["id"] = str(item["id"])
             result.append(item)
         return result
-
     return await asyncio.to_thread(fetch)
 
 
 async def create_assignment(database_url: str, task_id: UUID, worker_id: str, round_name: str) -> dict[str, str]:
     assignment_id = uuid4()
-
     def insert() -> dict[str, str]:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO assignments (assignment_id, task_id, worker_id, round)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (task_id, worker_id, round)
-                    DO UPDATE SET updated_at = NOW()
-                    RETURNING assignment_id, task_id, worker_id, round
-                    """,
-                    (assignment_id, task_id, worker_id, round_name),
-                )
+                cur.execute("INSERT INTO assignments (assignment_id, task_id, worker_id, round) VALUES (%s, %s, %s, %s) ON CONFLICT (task_id, worker_id, round) DO UPDATE SET status = 'assigned', updated_at = NOW() RETURNING assignment_id, task_id, worker_id, round", (assignment_id, task_id, worker_id, round_name))
                 row = cur.fetchone()
             conn.commit()
         assert row is not None
         return {"assignment_id": str(row[0]), "task_id": str(row[1]), "worker_id": str(row[2]), "round": str(row[3])}
-
     return await asyncio.to_thread(insert)
