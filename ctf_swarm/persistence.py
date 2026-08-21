@@ -91,10 +91,12 @@ async def create_task(database_url: str, redis: Redis, title: str, category: str
         return result
 
     result = await asyncio.to_thread(insert)
-    await redis.xadd("ctf:events", {
-        "type": "task_created", "task_id": result["id"],
-        "category": result["category"], "points": str(result["points"]),
-    }, maxlen=10000, approximate=True)
+    await redis.xadd(
+        "ctf:events",
+        {"type": "task_created", "task_id": result["id"], "category": result["category"], "points": str(result["points"])},
+        maxlen=10000,
+        approximate=True,
+    )
     return result
 
 
@@ -122,7 +124,10 @@ async def claim_task(database_url: str, task_id: UUID, status: str) -> bool:
     def claim() -> bool:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE tasks SET status = %s, updated_at = %s WHERE id = %s AND status = 'queued'", (status, now, task_id))
+                cur.execute(
+                    "UPDATE tasks SET status = %s, updated_at = %s WHERE id = %s AND status = 'queued'",
+                    (status, now, task_id),
+                )
                 changed = cur.rowcount == 1
             conn.commit()
         return changed
@@ -150,7 +155,12 @@ async def register_worker(database_url: str, redis: Redis, name: str, model: str
         return _serialize_row(row, ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"])
 
     result = await asyncio.to_thread(insert)
-    await redis.xadd("ctf:events", {"type": "worker_registered", "worker_id": result["id"], "model": result["model"]}, maxlen=10000, approximate=True)
+    await redis.xadd(
+        "ctf:events",
+        {"type": "worker_registered", "worker_id": result["id"], "model": result["model"]},
+        maxlen=10000,
+        approximate=True,
+    )
     return result
 
 
@@ -198,6 +208,30 @@ async def list_eligible_workers(database_url: str, category: str) -> list[dict[s
                 )
                 rows = cur.fetchall()
         return [_serialize_row(row, ["id", "name", "model", "capabilities", "status", "last_heartbeat", "created_at"]) for row in rows]
+
+    return await asyncio.to_thread(fetch)
+
+
+async def list_queued_tasks(database_url: str, category: str | None = None) -> list[dict[str, Any]]:
+    def fetch() -> list[dict[str, Any]]:
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                if category is None:
+                    cur.execute(
+                        "SELECT id, title, category, points, status, round, created_at, updated_at FROM tasks WHERE status = 'queued' ORDER BY created_at ASC"
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, title, category, points, status, round, created_at, updated_at FROM tasks WHERE status = 'queued' AND category = %s ORDER BY created_at ASC",
+                        (category,),
+                    )
+                rows = cur.fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = _serialize_row(row, ["id", "title", "category", "points", "status", "round", "created_at", "updated_at"])
+            item["id"] = str(item["id"])
+            result.append(item)
+        return result
 
     return await asyncio.to_thread(fetch)
 
