@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from .agent import Agent, AgentContext
 from .blackboard import Blackboard
-from .models import Candidate, Challenge, EventType, Round, TaskState
+from .models import Candidate, Challenge, EventType, Evidence, Round, TaskState
 from .verifier import Verifier
 
 
@@ -18,10 +18,7 @@ class Event:
 
 
 class Scheduler:
-    """Deterministic V1 orchestration core.
-
-    Provider/model execution is intentionally injected through Agent objects.
-    """
+    """Competitive multi-round orchestration with shared evidence and forced divergence."""
 
     def __init__(self, verifier: Verifier | None = None) -> None:
         self.verifier = verifier or Verifier()
@@ -31,15 +28,17 @@ class Scheduler:
         if state.cancelled or state.is_solved():
             return state.solved_value
 
+        board = Blackboard(state)
         state.active_agents = {a.id for a in agents}
         self.events.append(Event(EventType.TASK_STARTED, challenge.id))
-        board = Blackboard(state)
 
-        async def run_one(agent: Agent) -> Candidate | object | None:
+        async def run_one(agent: Agent) -> Candidate | Evidence | None:
             ctx = AgentContext(
                 challenge=challenge,
                 round=state.round,
                 dead_ends=frozenset(state.dead_ends),
+                explored_paths=frozenset(state.explored_paths),
+                open_hypotheses=frozenset(board.available_hypotheses()),
                 evidence=tuple(state.evidence),
             )
             return await agent.solve(ctx)
@@ -53,12 +52,15 @@ class Scheduler:
                     self.events.append(Event(EventType.CANDIDATE, challenge.id, result.agent_id, result))
                     if await self.verifier.verify(result):
                         state.solved_value = result.value
+                        state.solved_by = result.agent_id
                         state.cancelled = True
                         self.events.append(Event(EventType.VERIFIED, challenge.id, result.agent_id, result))
                         self.events.append(Event(EventType.GLOBAL_CANCEL, challenge.id, result.agent_id))
                         return result.value
-                elif result is not None:
+                elif isinstance(result, Evidence):
                     board.add_evidence(result)
+                    self.events.append(Event(EventType.EVIDENCE_MERGED, challenge.id, result.agent_id, result))
+                    self.events.append(Event(EventType.HYPOTHESIS, challenge.id, result.agent_id, board.context()))
         finally:
             for task in tasks:
                 if not task.done():
@@ -68,13 +70,53 @@ class Scheduler:
 
         return None
 
-    async def solve(self, challenge: Challenge, agents: list[Agent], max_rounds: int = 4) -> str | None:
+    async def run_critic_round(self, challenge: Challenge, critic: Agent, state: TaskState) -> str | None:
+        if state.cancelled or state.is_solved():
+            return state.solved_value
+        board = Blackboard(state)
+        state.round = Round.ADVERSARIAL
+        self.events.append(Event(EventType.ROUND_ADVANCED, challenge.id, payload=state.round.value))
+        result = await critic.solve(
+            AgentContext(
+                challenge=challenge,
+                round=Round.ADVERSARIAL,
+                dead_ends=frozenset(state.dead_ends),
+                explored_paths=frozenset(state.explored_paths),
+                open_hypotheses=frozenset(board.available_hypotheses()),
+                evidence=tuple(state.evidence),
+            )
+        )
+        if isinstance(result, Candidate) and await self.verifier.verify(result):
+            state.solved_value = result.value
+            state.solved_by = result.agent_id
+            state.cancelled = True
+            self.events.append(Event(EventType.VERIFIED, challenge.id, result.agent_id, result))
+            self.events.append(Event(EventType.GLOBAL_CANCEL, challenge.id, result.agent_id))
+            return result.value
+        if isinstance(result, Evidence):
+            board.add_evidence(result)
+            self.events.append(Event(EventType.CRITIQUE, challenge.id, result.agent_id, result))
+        return None
+
+    async def solve(
+        self,
+        challenge: Challenge,
+        agents: list[Agent],
+        max_rounds: int = 4,
+        critic: Agent | None = None,
+    ) -> str | None:
         state = TaskState(challenge=challenge)
-        rounds = [Round.INDEPENDENT, Round.COLLABORATIVE, Round.DIVERGENT, Round.ADVERSARIAL]
-        for index in range(min(max_rounds, len(rounds))):
-            state.round = rounds[index]
-            self.events.append(Event(EventType.ROUND_ADVANCED, challenge.id, payload=state.round.value))
+        rounds = [Round.INDEPENDENT, Round.COLLABORATIVE, Round.DIVERGENT]
+        for round_name in rounds[:max_rounds]:
+            state.round = round_name
+            self.events.append(Event(EventType.ROUND_ADVANCED, challenge.id, payload=round_name.value))
             result = await self.run_round(challenge, agents, state)
             if result:
                 return result
+
+        if critic is not None and not state.is_solved():
+            result = await self.run_critic_round(challenge, critic, state)
+            if result:
+                return result
+
         return None
