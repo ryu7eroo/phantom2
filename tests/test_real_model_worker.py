@@ -24,7 +24,7 @@ def test_provider_defaults_to_openai_compatible_endpoint():
     assert provider.model == "test-model"
 
 
-@pytest.mark.parametrize("round_name", ["independent", "collaborative", "divergent"])
+@pytest.mark.parametrize("round_name", ["independent", "collaborative", "divergent", "adversarial"])
 def test_parse_evidence_round(round_name):
     event = parse_response("evidence", "w", "t", round_name)
     assert event["round"] == round_name
@@ -35,8 +35,8 @@ def test_build_prompt_uses_no_think_for_fast_rounds():
         {"round": "independent", "title": "demo", "category": "misc", "points": "100"},
         {"history": [], "dead_ends": [], "open_hypotheses": []},
     )
-    assert "Do not repeat a known dead end" in prompt
     assert "Use /no_think" in prompt
+    assert "Avoid repeating known dead ends" in prompt
 
 
 def test_build_prompt_uses_think_for_divergent_round():
@@ -47,4 +47,14 @@ def test_build_prompt_uses_think_for_divergent_round():
     assert "known path" in prompt
     assert "old" in prompt
     assert "new" in prompt
+    assert "Use /think" in prompt
+
+
+def test_build_prompt_uses_adversarial_role():
+    prompt = build_prompt(
+        {"round": "adversarial", "title": "demo", "category": "misc", "points": "100"},
+        {"history": [{"claim": "known path"}], "dead_ends": ["old"], "open_hypotheses": ["new"]},
+    )
+    assert "adversarial" in prompt.lower()
+    assert "falsify" in prompt.lower() or "challenge" in prompt.lower()
     assert "Use /think" in prompt
