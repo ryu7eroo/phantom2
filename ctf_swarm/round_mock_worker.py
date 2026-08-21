@@ -22,8 +22,8 @@ async def get_blackboard(redis: Redis, task_id: str, round_name: str) -> dict[st
     history_key = f"ctf:bb:{task_id}:history"
     evidence_raw = await redis.hgetall(f"{key}:evidence")
     history_raw = await redis.lrange(history_key, 0, -1)
-    dead = sorted(await redis.smembers(f"{key}:dead"))
-    open_hypotheses = sorted(await redis.smembers(f"{key}:open"))
+    dead = sorted(await redis.smembers(f"ctf:bb:{task_id}:dead"))
+    open_hypotheses = sorted(await redis.smembers(f"ctf:bb:{task_id}:open"))
     return {
         "evidence": [json.loads(v) for v in evidence_raw.values()],
         "history": [json.loads(v) for v in history_raw],
