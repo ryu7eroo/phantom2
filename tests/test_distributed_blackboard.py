@@ -94,7 +94,7 @@ def test_blackboard_opens_next_round_only_after_all_workers_report():
     asyncio.run(run())
 
 
-def test_history_survives_round_local_clear():
+def test_history_and_dead_ends_survive_round_local_clear():
     async def run():
         redis = FakeRedis()
         board = DistributedBlackboard(redis, "task-2", Round.INDEPENDENT.value)
@@ -106,6 +106,6 @@ def test_history_survives_round_local_clear():
         snapshot = await next_board.snapshot()
         assert len(snapshot["history"]) == 1
         assert snapshot["history"][0]["claim"] == "round-1"
-        assert snapshot["dead_ends"] == []
+        assert snapshot["dead_ends"] == ["dead-a"]
 
     asyncio.run(run())
