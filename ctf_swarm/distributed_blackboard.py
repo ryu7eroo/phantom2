@@ -9,7 +9,7 @@ from .models import Evidence, Round
 
 
 class DistributedBlackboard:
-    """Redis-backed evidence and round barrier for distributed workers."""
+    """Redis-backed evidence, history, and round barrier for distributed workers."""
 
     def __init__(self, redis: Redis, task_id: str, round_name: str) -> None:
         self.redis = redis
@@ -20,6 +20,7 @@ class DistributedBlackboard:
         self.evidence_key = f"{self.prefix}:evidence"
         self.dead_key = f"{self.prefix}:dead"
         self.open_key = f"{self.prefix}:open"
+        self.history_key = f"ctf:bb:{task_id}:history"
 
     async def register_workers(self, worker_ids: list[str]) -> None:
         if worker_ids:
@@ -28,7 +29,9 @@ class DistributedBlackboard:
     async def record_evidence(self, evidence: Evidence) -> bool:
         payload = asdict(evidence)
         payload["round"] = evidence.round.value
-        await self.redis.hset(self.evidence_key, evidence.agent_id, json.dumps(payload))
+        encoded = json.dumps(payload)
+        await self.redis.hset(self.evidence_key, evidence.agent_id, encoded)
+        await self.redis.rpush(self.history_key, encoded)
         if evidence.failed_paths:
             await self.redis.sadd(self.dead_key, *evidence.failed_paths)
         if evidence.next_hypotheses:
@@ -37,20 +40,22 @@ class DistributedBlackboard:
         return await self.redis.scard(self.pending_key) == 0
 
     async def snapshot(self) -> dict[str, object]:
-        raw = await self.redis.hgetall(self.evidence_key)
-        evidence: list[dict[str, object]] = []
-        for value in raw.values():
-            evidence.append(json.loads(value))
+        raw_history = await self.redis.lrange(self.history_key, 0, -1)
+        history = [json.loads(value) for value in raw_history]
+        current_raw = await self.redis.hgetall(self.evidence_key)
+        current_round_evidence = [json.loads(value) for value in current_raw.values()]
         return {
             "task_id": self.task_id,
             "round": self.round,
-            "evidence": evidence,
+            "evidence": current_round_evidence,
+            "history": history,
             "dead_ends": sorted(await self.redis.smembers(self.dead_key)),
             "open_hypotheses": sorted(await self.redis.smembers(self.open_key)),
             "pending_workers": sorted(await self.redis.smembers(self.pending_key)),
         }
 
     async def clear(self) -> None:
+        # Round-local barrier state can be cleared; task-wide history is retained.
         await self.redis.delete(self.pending_key, self.evidence_key, self.dead_key, self.open_key)
 
 
