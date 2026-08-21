@@ -3,10 +3,15 @@ name = "ctf-swarm"
 version = "0.1.0"
 description = "Multi-agent CTF solving swarm"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.116,<1",
+    "redis>=6,<7",
+    "psycopg[binary]>=3.2,<4",
+    "uvicorn[standard]>=0.35,<1",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9"]
+dev = ["pytest>=8,<9", "httpx>=0.28,<1"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
