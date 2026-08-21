@@ -9,18 +9,35 @@ import time
 from redis.asyncio import Redis
 
 from .agent import AgentContext
+from .distributed_blackboard import DistributedBlackboard
 from .models import Challenge, Evidence, Round
 from .openai_compatible_provider import OpenAICompatibleProvider
 
 
-def build_prompt(fields: dict[str, str]) -> str:
+def build_prompt(fields: dict[str, str], snapshot: dict[str, object]) -> str:
+    round_name = fields.get("round", Round.INDEPENDENT.value)
+    history = snapshot.get("history", [])
+    dead_ends = snapshot.get("dead_ends", [])
+    open_hypotheses = snapshot.get("open_hypotheses", [])
+
+    if round_name in {Round.INDEPENDENT.value, Round.COLLABORATIVE.value}:
+        thinking = "/no_think"
+    else:
+        thinking = "/think"
+
     return (
         "Solve the following CTF challenge. Work systematically and use the shared evidence.\n"
         f"Title: {fields.get('title', '')}\n"
         f"Category: {fields.get('category', '')}\n"
-        f"Round: {fields.get('round', 'independent')}\n"
+        f"Round: {round_name}\n"
         f"Points: {fields.get('points', '0')}\n\n"
-        "Return either a concise hypothesis/evidence report or a verified flag candidate."
+        f"Known dead ends: {json.dumps(dead_ends)}\n"
+        f"Open hypotheses: {json.dumps(open_hypotheses)}\n"
+        f"Shared evidence history: {json.dumps(history[-12:])}\n\n"
+        "Do not repeat a known dead end. In collaborative rounds, explicitly build on useful prior evidence. "
+        "In divergent rounds, choose a materially different approach from the known paths. "
+        "Return a concise hypothesis/evidence report or a verified flag candidate.\n"
+        f"Use {thinking}."
     )
 
 
@@ -74,8 +91,28 @@ async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
                         continue
                     task_id = fields["task_id"]
                     round_name = fields.get("round", Round.INDEPENDENT.value)
-                    pubsub = redis.pubsub()
-                    await pubsub.subscribe(f"ctf:cancel:{task_id}")
+                    try:
+                        current_round = Round(round_name)
+                    except ValueError:
+                        current_round = Round.INDEPENDENT
+                        round_name = current_round.value
+
+                    board = DistributedBlackboard(redis, task_id, round_name)
+                    snapshot = await board.snapshot()
+                    evidence_items = []
+                    for item in snapshot.get("history", []):
+                        evidence_items.append(
+                            Evidence(
+                                agent_id=str(item.get("agent_id", "unknown")),
+                                challenge_id=task_id,
+                                claim=str(item.get("claim", "")),
+                                evidence=tuple(item.get("evidence", ())) if isinstance(item.get("evidence"), list) else (),
+                                failed_paths=tuple(item.get("failed_paths", ())) if isinstance(item.get("failed_paths"), list) else (),
+                                confidence=float(item.get("confidence", 0.0)),
+                                round=Round(str(item.get("round", Round.INDEPENDENT.value))),
+                            )
+                        )
+
                     context = AgentContext(
                         challenge=Challenge(
                             id=task_id,
@@ -83,12 +120,15 @@ async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
                             category=fields.get("category", "misc"),
                             points=int(fields.get("points", "0")),
                         ),
-                        round=Round(round_name),
-                        dead_ends=frozenset(),
-                        evidence=(),
+                        round=current_round,
+                        dead_ends=frozenset(str(x) for x in snapshot.get("dead_ends", [])),
+                        evidence=tuple(evidence_items[-12:]),
                     )
+
+                    pubsub = redis.pubsub()
+                    await pubsub.subscribe(f"ctf:cancel:{task_id}")
                     solve_task = asyncio.create_task(
-                        provider.generate(context, build_prompt(fields))
+                        provider.generate(context, build_prompt(fields, snapshot))
                     )
                     cancel_task = asyncio.create_task(
                         pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
@@ -103,8 +143,9 @@ async def run(worker_id: str, model: str, base_url: str, delay: float) -> None:
                                 result = solve_task.result()
                                 event = parse_response(result.text, worker_id, task_id, round_name)
                                 await redis.xadd("ctf:events", event, maxlen=10000, approximate=True)
-                                print(f"[model-worker {worker_id}] emitted {event['type']} task={task_id}", flush=True)
+                                print(f"[model-worker {worker_id}] emitted {event['type']} task={task_id} round={round_name}", flush=True)
                                 break
+
                             cancel_task = asyncio.create_task(
                                 pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                             )
