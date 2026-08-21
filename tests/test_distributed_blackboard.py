@@ -9,6 +9,7 @@ class FakeRedis:
     def __init__(self):
         self.sets = {}
         self.hashes = {}
+        self.lists = {}
 
     async def sadd(self, key, *values):
         bucket = self.sets.setdefault(key, set())
@@ -37,6 +38,16 @@ class FakeRedis:
 
     async def hgetall(self, key):
         return self.hashes.get(key, {})
+
+    async def rpush(self, key, value):
+        self.lists.setdefault(key, []).append(value)
+        return len(self.lists[key])
+
+    async def lrange(self, key, start, end):
+        values = self.lists.get(key, [])
+        if end == -1:
+            end = len(values)
+        return values[start:end + 1]
 
     async def delete(self, *keys):
         for key in keys:
@@ -77,6 +88,24 @@ def test_blackboard_opens_next_round_only_after_all_workers_report():
         assert sorted(snapshot["dead_ends"]) == ["dead-a", "dead-b", "dead-c"]
         assert sorted(snapshot["open_hypotheses"]) == ["open-a", "open-b", "open-c"]
         assert len(snapshot["evidence"]) == 3
+        assert len(snapshot["history"]) == 3
         json.dumps(snapshot)
+
+    asyncio.run(run())
+
+
+def test_history_survives_round_local_clear():
+    async def run():
+        redis = FakeRedis()
+        board = DistributedBlackboard(redis, "task-2", Round.INDEPENDENT.value)
+        await board.register_workers(["a"])
+        await board.record_evidence(Evidence("a", "task-2", "round-1", failed_paths=("dead-a",), round=Round.INDEPENDENT))
+        await board.clear()
+
+        next_board = DistributedBlackboard(redis, "task-2", Round.COLLABORATIVE.value)
+        snapshot = await next_board.snapshot()
+        assert len(snapshot["history"]) == 1
+        assert snapshot["history"][0]["claim"] == "round-1"
+        assert snapshot["dead_ends"] == []
 
     asyncio.run(run())
